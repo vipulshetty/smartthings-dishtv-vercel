@@ -8,10 +8,12 @@ import requests
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
 
+
 app = FastAPI(title="SmartThings DishTV Auto-Source")
 
+
 # ============================================================
-# CONFIG
+# CONFIGURATION
 # ============================================================
 
 ST_API_BASE = "https://api.smartthings.com/v1"
@@ -26,17 +28,19 @@ LOCATION_ID = os.getenv(
     "22fde621-3b05-442e-961b-2ca8c5b67574",
 ).strip()
 
+# Desired delay after the TV ON/ONLINE event.
 DELAY_SECONDS = int(
     os.getenv("DISHTV_DELAY_SECONDS", "20")
 )
 
-# Existing PAT - keep this for the actual TV command.
+# Existing Personal Access Token.
+# We keep using this for the actual HDMI2 command for now.
 ST_ACCESS_TOKEN = os.getenv(
     "ST_ACCESS_TOKEN",
     "",
 ).strip()
 
-# OAuth-In App
+# OAuth-In App credentials.
 CLIENT_ID = os.getenv(
     "ST_CLIENT_ID",
     "",
@@ -52,14 +56,10 @@ REDIRECT_URI = os.getenv(
     "",
 ).strip()
 
-# Persistent value supplied through Vercel.
-OAUTH_STATE = os.getenv(
-    "ST_OAUTH_STATE",
-    "",
-).strip()
 
-if not OAUTH_STATE:
-    OAUTH_STATE = secrets.token_urlsafe(32)
+# ============================================================
+# RUNTIME STATUS
+# ============================================================
 
 last_event = {
     "status": "idle"
@@ -67,7 +67,7 @@ last_event = {
 
 
 # ============================================================
-# PAT AUTH
+# PAT AUTHENTICATION
 # ============================================================
 
 def pat_headers():
@@ -86,7 +86,7 @@ def pat_headers():
 # OAUTH
 # ============================================================
 
-def oauth_start_url():
+def build_oauth_url(state: str):
     if not CLIENT_ID:
         raise RuntimeError(
             "ST_CLIENT_ID is not configured"
@@ -102,11 +102,11 @@ def oauth_start_url():
         "response_type": "code",
         "redirect_uri": REDIRECT_URI,
         "scope": "r:devices:* x:devices:*",
-        "state": OAUTH_STATE,
+        "state": state,
     }
 
     return (
-        "https://api.smartthings.com/oauth/authorize?"
+        "https://api.smartthings.com/v1/oauth/authorize?"
         + urlencode(params)
     )
 
@@ -132,7 +132,7 @@ def exchange_code(code: str):
     ).decode("ascii")
 
     response = requests.post(
-        "https://api.smartthings.com/oauth/token",
+        "https://api.smartthings.com/v1/oauth/token",
         headers={
             "Authorization": f"Basic {basic_auth}",
             "Accept": "application/json",
@@ -149,27 +149,28 @@ def exchange_code(code: str):
         timeout=15,
     )
 
-    response.raise_for_status()
+    if not response.ok:
+        raise RuntimeError(
+            f"SmartThings OAuth token exchange failed: "
+            f"{response.status_code} "
+            f"{response.text}"
+        )
 
     return response.json()
 
 
 # ============================================================
-# SUBSCRIPTIONS
+# DEVICE SUBSCRIPTION
 # ============================================================
 
 def create_device_subscription(
     access_token: str,
     installed_app_id: str,
 ):
-    """
-    Receive device capability events for this TV.
-    """
-
     body = {
         "sourceType": "DEVICE",
         "device": {
-            "deviceId": DEVICE_ID,
+            "deviceId": DEVICE_ID
         },
         "subscriptionName": "dishtvDeviceEvents",
     }
@@ -188,34 +189,41 @@ def create_device_subscription(
         timeout=15,
     )
 
+    # Already exists = okay.
     if response.status_code == 409:
         return {
             "already_exists": True,
             "detail": response.text,
         }
 
-    response.raise_for_status()
+    if not response.ok:
+        raise RuntimeError(
+            f"Device subscription failed: "
+            f"{response.status_code} "
+            f"{response.text}"
+        )
 
     return response.json()
 
+
+# ============================================================
+# HEALTH SUBSCRIPTION
+# ============================================================
 
 def create_health_subscription(
     access_token: str,
     installed_app_id: str,
 ):
     """
-    Receive ONLINE/OFFLINE health events for this TV.
+    Subscribe to health events for the location.
 
-    DEVICE_HEALTH subscriptions are officially supported by
-    SmartThings.
+    We intentionally use locationId here rather than
+    mixing locationId and deviceIds.
     """
 
     body = {
         "sourceType": "DEVICE_HEALTH",
         "deviceHealth": {
-            "deviceIds": [
-                DEVICE_ID
-            ],
             "locationId": LOCATION_ID,
             "subscriptionName": "dishtvHealthEvents",
         },
@@ -235,13 +243,19 @@ def create_health_subscription(
         timeout=15,
     )
 
+    # Already exists = okay.
     if response.status_code == 409:
         return {
             "already_exists": True,
             "detail": response.text,
         }
 
-    response.raise_for_status()
+    if not response.ok:
+        raise RuntimeError(
+            f"Health subscription failed: "
+            f"{response.status_code} "
+            f"{response.text}"
+        )
 
     return response.json()
 
@@ -252,8 +266,8 @@ def create_health_subscription(
 
 def set_dishtv_source():
     """
-    Switch Samsung TV to HDMI2.
-    HDMI2 = DishTV.
+    Switch the Samsung TV to HDMI2.
+    HDMI2 is the DishTV input.
     """
 
     body = {
@@ -282,7 +296,12 @@ def set_dishtv_source():
         timeout=15,
     )
 
-    response.raise_for_status()
+    if not response.ok:
+        raise RuntimeError(
+            f"TV command failed: "
+            f"{response.status_code} "
+            f"{response.text}"
+        )
 
     return (
         response.json()
@@ -301,7 +320,12 @@ def get_source():
         timeout=15,
     )
 
-    response.raise_for_status()
+    if not response.ok:
+        raise RuntimeError(
+            f"TV status failed: "
+            f"{response.status_code} "
+            f"{response.text}"
+        )
 
     data = response.json()
 
@@ -325,13 +349,18 @@ def get_health():
         timeout=15,
     )
 
-    response.raise_for_status()
+    if not response.ok:
+        raise RuntimeError(
+            f"TV health check failed: "
+            f"{response.status_code} "
+            f"{response.text}"
+        )
 
     return response.json()
 
 
 # ============================================================
-# WEB
+# HOME / HEALTH
 # ============================================================
 
 @app.get("/")
@@ -339,10 +368,24 @@ def home():
     return HTMLResponse(
         """
         <h2>SmartThings → DishTV</h2>
+
         <p>Service is running.</p>
-        <p><a href="/health">Health</a></p>
-        <p><a href="/oauth/start">Connect SmartThings</a></p>
-        <p><a href="/test-source">Test HDMI2</a></p>
+
+        <p>
+            <a href="/health">Health</a>
+        </p>
+
+        <p>
+            <a href="/oauth/start">
+                Connect SmartThings
+            </a>
+        </p>
+
+        <p>
+            <a href="/test-source">
+                Test HDMI2
+            </a>
+        </p>
         """
     )
 
@@ -363,7 +406,7 @@ def health():
 
 
 # ============================================================
-# MANUAL COMMAND TEST
+# MANUAL SOURCE TEST
 # ============================================================
 
 @app.get("/test-source")
@@ -384,16 +427,35 @@ def test_source():
 
 
 # ============================================================
-# OAUTH
+# OAUTH START
 # ============================================================
 
 @app.get("/oauth/start")
 def oauth_start():
     try:
-        return RedirectResponse(
-            oauth_start_url(),
+        # Generate state for THIS browser session.
+        state = secrets.token_urlsafe(32)
+
+        url = build_oauth_url(state)
+
+        response = RedirectResponse(
+            url,
             status_code=302,
         )
+
+        # Store state in the browser rather than a server
+        # process variable. This works correctly with Vercel's
+        # serverless execution model.
+        response.set_cookie(
+            key="st_oauth_state",
+            value=state,
+            max_age=600,
+            httponly=True,
+            secure=True,
+            samesite="lax",
+        )
+
+        return response
 
     except Exception as exc:
         raise HTTPException(
@@ -402,12 +464,18 @@ def oauth_start():
         )
 
 
+# ============================================================
+# OAUTH CALLBACK
+# ============================================================
+
 @app.get("/oauth/callback")
 def oauth_callback(
+    request: Request,
     code: str | None = None,
     state: str | None = None,
     error: str | None = None,
 ):
+    # SmartThings returned an OAuth error.
     if error:
         return JSONResponse(
             {
@@ -417,7 +485,33 @@ def oauth_callback(
             status_code=400,
         )
 
-    if state != OAUTH_STATE:
+    # Get the original state from the browser cookie.
+    stored_state = request.cookies.get(
+        "st_oauth_state"
+    )
+
+    if not state:
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "missing OAuth state",
+            },
+            status_code=400,
+        )
+
+    if not stored_state:
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": (
+                    "OAuth state cookie is missing. "
+                    "Start again from /oauth/start."
+                ),
+            },
+            status_code=400,
+        )
+
+    if state != stored_state:
         return JSONResponse(
             {
                 "ok": False,
@@ -436,10 +530,15 @@ def oauth_callback(
         )
 
     try:
+        # Exchange authorization code for OAuth tokens.
         tokens = exchange_code(code)
 
         installed_app_id = tokens.get(
             "installed_app_id"
+        )
+
+        access_token = tokens.get(
+            "access_token"
         )
 
         if not installed_app_id:
@@ -447,23 +546,28 @@ def oauth_callback(
                 "SmartThings did not return installed_app_id"
             )
 
+        if not access_token:
+            raise RuntimeError(
+                "SmartThings did not return access_token"
+            )
+
         # Create normal device subscription.
         device_subscription = (
             create_device_subscription(
-                tokens["access_token"],
+                access_token,
                 installed_app_id,
             )
         )
 
-        # Create health subscription.
+        # Create ONLINE/OFFLINE health subscription.
         health_subscription = (
             create_health_subscription(
-                tokens["access_token"],
+                access_token,
                 installed_app_id,
             )
         )
 
-        return JSONResponse(
+        response = JSONResponse(
             {
                 "ok": True,
                 "installed_app_id": installed_app_id,
@@ -473,11 +577,18 @@ def oauth_callback(
                     health_subscription,
                 "message": (
                     "SmartThings connected. "
-                    "Device + health subscriptions "
+                    "Device and health subscriptions "
                     "are configured."
                 ),
             }
         )
+
+        # State is no longer needed.
+        response.delete_cookie(
+            "st_oauth_state"
+        )
+
+        return response
 
     except Exception as exc:
         return JSONResponse(
@@ -498,7 +609,7 @@ async def webhook(request: Request):
     payload = await request.json()
 
     # --------------------------------------------------------
-    # Target URL confirmation
+    # SmartThings target URL confirmation handshake
     # --------------------------------------------------------
 
     if payload.get("messageType") == "CONFIRMATION":
@@ -527,9 +638,15 @@ async def webhook(request: Request):
             }
         )
 
+    # --------------------------------------------------------
+    # Ignore non-event messages
+    # --------------------------------------------------------
+
     if payload.get("messageType") != "EVENT":
         return JSONResponse(
-            {"ok": True}
+            {
+                "ok": True
+            }
         )
 
     events = (
@@ -538,12 +655,12 @@ async def webhook(request: Request):
         .get("events", [])
     )
 
-    # ========================================================
-    # FIND THE RELEVANT EVENT
-    # ========================================================
+    switch_on = False
+    health_online = False
 
-    device_on_event = False
-    health_online_event = False
+    # --------------------------------------------------------
+    # Inspect all events in the webhook payload.
+    # --------------------------------------------------------
 
     for event in events:
 
@@ -551,9 +668,9 @@ async def webhook(request: Request):
             "eventType"
         )
 
-        # ----------------------------------------------------
-        # Normal switch event
-        # ----------------------------------------------------
+        # ====================================================
+        # DEVICE_EVENT
+        # ====================================================
 
         if event_type == "DEVICE_EVENT":
 
@@ -570,49 +687,48 @@ async def webhook(request: Request):
             if (
                 de.get("deviceId")
                 == DEVICE_ID
+
                 and component_id == "main"
+
                 and de.get("capability")
                 == "switch"
+
                 and de.get("attribute")
                 == "switch"
+
                 and de.get("value")
                 == "on"
+
                 and de.get("stateChange", False)
             ):
-                device_on_event = True
+                switch_on = True
 
-        # ----------------------------------------------------
-        # Device health ONLINE event
-        # ----------------------------------------------------
+        # ====================================================
+        # DEVICE_HEALTH_EVENT
+        # ====================================================
 
         elif event_type == "DEVICE_HEALTH_EVENT":
 
-            he = event.get(
+            health_event = event.get(
                 "deviceHealthEvent",
                 {}
             )
 
             if (
-                he.get("deviceId")
+                health_event.get("deviceId")
                 == DEVICE_ID
-                and he.get("status")
+
+                and health_event.get("status")
                 == "ONLINE"
             ):
-                health_online_event = True
+                health_online = True
 
-    # ========================================================
-    # TRIGGER ON EITHER EVENT
-    #
-    # Normal ON event:
-    #     switch -> on
-    #
-    # Wall power:
-    #     health -> ONLINE
-    #
-    # Both are accepted.
-    # ========================================================
+    # --------------------------------------------------------
+    # Nothing relevant.
+    # --------------------------------------------------------
 
-    if not device_on_event and not health_online_event:
+    if not switch_on and not health_online:
+
         return JSONResponse(
             {
                 "ok": True,
@@ -620,107 +736,112 @@ async def webhook(request: Request):
             }
         )
 
-    trigger_type = []
+    # --------------------------------------------------------
+    # Record what triggered us.
+    # --------------------------------------------------------
 
-    if device_on_event:
-        trigger_type.append("switch_on")
+    trigger = []
 
-    if health_online_event:
-        trigger_type.append("health_online")
+    if switch_on:
+        trigger.append("switch_on")
+
+    if health_online:
+        trigger.append("health_online")
 
     last_event.clear()
 
     last_event.update(
         {
             "status": "trigger_received",
-            "trigger": trigger_type,
+            "trigger": trigger,
         }
     )
 
-    # ========================================================
-    # WAIT FOR TV BOOT
-    # ========================================================
+    # --------------------------------------------------------
+    # Wait 20 seconds.
+    # --------------------------------------------------------
 
     time.sleep(DELAY_SECONDS)
 
     try:
 
-        # ====================================================
-        # CHECK TV HEALTH
-        # ====================================================
+        # ----------------------------------------------------
+        # Make sure the TV is reachable.
+        # ----------------------------------------------------
 
         health = get_health()
 
-        # Give SmartThings another 5 seconds if the TV
-        # is not yet reachable.
+        # If still offline, give it another 5 seconds.
         if health.get("state") != "ONLINE":
 
             time.sleep(5)
 
             health = get_health()
 
-        # ====================================================
-        # READ CURRENT SOURCE
-        # ====================================================
+        # ----------------------------------------------------
+        # Read source before command.
+        # ----------------------------------------------------
 
         before = get_source()
 
-        # ====================================================
-        # SWITCH TO DISHTV
-        # ====================================================
+        # ----------------------------------------------------
+        # Send HDMI2.
+        # ----------------------------------------------------
 
-        result = set_dishtv_source()
+        first_result = set_dishtv_source()
 
+        # Give the TV a moment to process it.
         time.sleep(2)
 
-        # ====================================================
-        # VERIFY
-        # ====================================================
+        # ----------------------------------------------------
+        # Verify.
+        # ----------------------------------------------------
 
         after = get_source()
 
-        # ====================================================
-        # RETRY IF NECESSARY
-        # ====================================================
+        # ----------------------------------------------------
+        # Retry once if HDMI2 did not stick.
+        # ----------------------------------------------------
+
+        result = first_result
 
         if after != "HDMI2":
 
             time.sleep(3)
 
-            retry_result = (
-                set_dishtv_source()
-            )
+            retry_result = set_dishtv_source()
 
             time.sleep(2)
 
             after = get_source()
 
             result = {
-                "first_attempt": result,
+                "first_attempt": first_result,
                 "retry": retry_result,
             }
 
-        # ====================================================
-        # SAVE RESULT
-        # ====================================================
+        # ----------------------------------------------------
+        # Store final state.
+        # ----------------------------------------------------
+
+        if after == "HDMI2":
+
+            final_status = "source_set"
+
+        else:
+
+            final_status = "source_not_changed"
 
         last_event.clear()
 
         last_event.update(
             {
-                "status": (
-                    "source_set"
-                    if after == "HDMI2"
-                    else "source_not_changed"
-                ),
-                "trigger": trigger_type,
+                "status": final_status,
+                "trigger": trigger,
                 "before": before,
                 "after": after,
-                "health": health.get(
-                    "state"
-                ),
-                "delay_seconds":
-                    DELAY_SECONDS,
+                "health": health.get("state"),
+                "delay_seconds": DELAY_SECONDS,
             }
         )
 
@@ -728,12 +849,10 @@ async def webhook(request: Request):
             {
                 "ok": after == "HDMI2",
                 "matched": True,
-                "trigger": trigger_type,
+                "trigger": trigger,
                 "before": before,
                 "after": after,
-                "health": health.get(
-                    "state"
-                ),
+                "health": health.get("state"),
                 "result": result,
             }
         )
@@ -744,9 +863,8 @@ async def webhook(request: Request):
 
         last_event.update(
             {
-                "status":
-                    "command_failed",
-                "trigger": trigger_type,
+                "status": "command_failed",
+                "trigger": trigger,
                 "error": str(exc),
             }
         )
@@ -755,7 +873,7 @@ async def webhook(request: Request):
             {
                 "ok": False,
                 "matched": True,
-                "trigger": trigger_type,
+                "trigger": trigger,
                 "error": str(exc),
             },
             status_code=502,
