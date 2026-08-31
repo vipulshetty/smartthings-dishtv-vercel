@@ -1,6 +1,7 @@
 import os
 import time
 import base64
+import secrets
 from urllib.parse import urlencode
 
 import requests
@@ -10,17 +11,27 @@ from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
 app = FastAPI(title="SmartThings DishTV Auto-Source")
 
 ST_BASE = "https://api.smartthings.com/v1"
-DEVICE_ID = os.getenv("ST_DEVICE_ID", "84a47e06-88fa-db59-e9aa-2764d5f5c420").strip()
-LOCATION_ID = os.getenv("ST_LOCATION_ID", "22fde621-3b05-442e-961b-2ca8c5b67574").strip()
+DEVICE_ID = os.getenv(
+    "ST_DEVICE_ID",
+    "84a47e06-88fa-db59-e9aa-2764d5f5c420",
+).strip()
+LOCATION_ID = os.getenv(
+    "ST_LOCATION_ID",
+    "22fde621-3b05-442e-961b-2ca8c5b67574",
+).strip()
 DELAY_SECONDS = int(os.getenv("DISHTV_DELAY_SECONDS", "20"))
 
 # Keep the already-working PAT for device commands for now.
 ST_ACCESS_TOKEN = os.getenv("ST_ACCESS_TOKEN", "").strip()
 
-# OAuth-In SmartApp credentials. Used for authorization + subscription setup.
+# OAuth-In SmartApp credentials.
 CLIENT_ID = os.getenv("ST_CLIENT_ID", "").strip()
 CLIENT_SECRET = os.getenv("ST_CLIENT_SECRET", "").strip()
 REDIRECT_URI = os.getenv("ST_REDIRECT_URI", "").strip()
+
+# A single-user setup is sufficient here.
+# For multi-user production use, persist this server-side per session/install.
+OAUTH_STATE = os.getenv("ST_OAUTH_STATE", "").strip() or secrets.token_urlsafe(32)
 
 last_event = {"status": "idle"}
 
@@ -37,11 +48,13 @@ def pat_headers():
 def oauth_start_url():
     if not CLIENT_ID or not REDIRECT_URI:
         raise RuntimeError("ST_CLIENT_ID and ST_REDIRECT_URI must be configured")
+
     params = {
         "client_id": CLIENT_ID,
         "scope": "r:devices:* x:devices:*",
         "response_type": "code",
         "redirect_uri": REDIRECT_URI,
+        "state": OAUTH_STATE,
     }
     return "https://api.smartthings.com/v1/oauth/authorize?" + urlencode(params)
 
@@ -49,7 +62,11 @@ def oauth_start_url():
 def exchange_code(code: str):
     if not CLIENT_ID or not CLIENT_SECRET or not REDIRECT_URI:
         raise RuntimeError("OAuth environment variables are incomplete")
-    auth = base64.b64encode(f"{CLIENT_ID}:{CLIENT_SECRET}".encode()).decode()
+
+    auth = base64.b64encode(
+        f"{CLIENT_ID}:{CLIENT_SECRET}".encode("utf-8")
+    ).decode("ascii")
+
     r = requests.post(
         f"{ST_BASE}/oauth/token",
         headers={
@@ -60,6 +77,7 @@ def exchange_code(code: str):
         data={
             "grant_type": "authorization_code",
             "code": code,
+            "client_id": CLIENT_ID,
             "redirect_uri": REDIRECT_URI,
         },
         timeout=15,
@@ -74,6 +92,7 @@ def create_device_subscription(access_token: str, installed_app_id: str):
         "device": {"deviceId": DEVICE_ID},
         "subscriptionName": "dishtvBootHandler",
     }
+
     r = requests.post(
         f"{ST_BASE}/installedapps/{installed_app_id}/subscriptions",
         headers={
@@ -84,8 +103,10 @@ def create_device_subscription(access_token: str, installed_app_id: str):
         json=body,
         timeout=15,
     )
+
     if r.status_code == 409:
         return {"already_exists": True, "detail": r.text}
+
     r.raise_for_status()
     return r.json()
 
@@ -99,6 +120,7 @@ def set_dishtv_source():
             "arguments": ["HDMI2"],
         }]
     }
+
     r = requests.post(
         f"{ST_BASE}/devices/{DEVICE_ID}/commands",
         headers={**pat_headers(), "Content-Type": "application/json"},
@@ -116,6 +138,7 @@ def get_source():
         timeout=15,
     )
     r.raise_for_status()
+
     data = r.json()
     return (
         data.get("components", {})
@@ -124,6 +147,16 @@ def get_source():
         .get("inputSource", {})
         .get("value")
     )
+
+
+def get_health():
+    r = requests.get(
+        f"{ST_BASE}/devices/{DEVICE_ID}/health",
+        headers=pat_headers(),
+        timeout=15,
+    )
+    r.raise_for_status()
+    return r.json()
 
 
 @app.get("/")
@@ -142,7 +175,9 @@ def health():
         "ok": True,
         "device_id": DEVICE_ID,
         "delay_seconds": DELAY_SECONDS,
-        "oauth_configured": bool(CLIENT_ID and CLIENT_SECRET and REDIRECT_URI),
+        "oauth_configured": bool(
+            CLIENT_ID and CLIENT_SECRET and REDIRECT_URI
+        ),
         "last_event": last_event,
     }
 
@@ -165,25 +200,57 @@ def oauth_start():
 
 
 @app.get("/oauth/callback")
-def oauth_callback(code: str | None = None, error: str | None = None):
+def oauth_callback(
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+):
     if error:
-        return JSONResponse({"ok": False, "error": error}, status_code=400)
+        return JSONResponse(
+            {"ok": False, "error": error},
+            status_code=400,
+        )
+
+    if state != OAUTH_STATE:
+        return JSONResponse(
+            {"ok": False, "error": "invalid OAuth state"},
+            status_code=400,
+        )
+
     if not code:
-        return JSONResponse({"ok": False, "error": "missing authorization code"}, status_code=400)
+        return JSONResponse(
+            {"ok": False, "error": "missing authorization code"},
+            status_code=400,
+        )
+
     try:
         tokens = exchange_code(code)
         installed_app_id = tokens.get("installed_app_id")
+
         if not installed_app_id:
-            raise RuntimeError("SmartThings did not return installed_app_id")
-        subscription = create_device_subscription(tokens["access_token"], installed_app_id)
+            raise RuntimeError(
+                "SmartThings did not return installed_app_id"
+            )
+
+        subscription = create_device_subscription(
+            tokens["access_token"],
+            installed_app_id,
+        )
+
         return JSONResponse({
             "ok": True,
             "installed_app_id": installed_app_id,
             "subscription": subscription,
-            "message": "SmartThings is connected. You can close this page."
+            "message": (
+                "SmartThings is connected and the device subscription "
+                "has been created. You can close this page."
+            ),
         })
     except Exception as exc:
-        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+        return JSONResponse(
+            {"ok": False, "error": str(exc)},
+            status_code=502,
+        )
 
 
 @app.post("/")
@@ -192,31 +259,42 @@ async def webhook(request: Request):
 
     # SmartThings target URL confirmation handshake.
     if payload.get("messageType") == "CONFIRMATION":
-        confirmation_url = payload.get("confirmationData", {}).get("confirmationUrl")
+        confirmation_url = (
+            payload.get("confirmationData", {}).get("confirmationUrl")
+        )
         if confirmation_url:
             try:
                 requests.get(confirmation_url, timeout=10)
             except requests.RequestException:
                 pass
-        return JSONResponse({"ok": True, "confirmed": bool(confirmation_url)})
+
+        return JSONResponse({
+            "ok": True,
+            "confirmed": bool(confirmation_url),
+        })
 
     if payload.get("messageType") != "EVENT":
         return JSONResponse({"ok": True})
 
     events = payload.get("eventData", {}).get("events", [])
     matched = False
+
     for event in events:
         if event.get("eventType") != "DEVICE_EVENT":
             continue
+
         de = event.get("deviceEvent", {})
+
         if (
             de.get("deviceId") == DEVICE_ID
-            and de.get("component") == "main"
+            and de.get("componentId", de.get("component")) == "main"
             and de.get("capability") == "switch"
             and de.get("attribute") == "switch"
             and de.get("value") == "on"
+            and de.get("stateChange", True)
         ):
             matched = True
+
             last_event.clear()
             last_event.update({
                 "status": "received_on",
@@ -225,22 +303,56 @@ async def webhook(request: Request):
             })
 
     if not matched:
-        return JSONResponse({"ok": True, "matched": False})
+        return JSONResponse({
+            "ok": True,
+            "matched": False,
+        })
 
+    # Keep the delay short and deterministic.
     time.sleep(DELAY_SECONDS)
+
     try:
+        health = get_health()
+
+        # If the TV is still offline, give SmartThings a little more time.
+        # This is intentionally capped so the total delay stays near 30 sec.
+        if health.get("state") != "ONLINE":
+            time.sleep(5)
+            health = get_health()
+
         before = get_source()
         result = set_dishtv_source()
         after = get_source()
+
         last_event.clear()
         last_event.update({
             "status": "source_set",
             "before": before,
             "after": after,
+            "health": health.get("state"),
             "delay_seconds": DELAY_SECONDS,
         })
-        return JSONResponse({"ok": True, "matched": True, "before": before, "after": after, "result": result})
+
+        return JSONResponse({
+            "ok": True,
+            "matched": True,
+            "before": before,
+            "after": after,
+            "health": health.get("state"),
+            "result": result,
+        })
+
     except Exception as exc:
         last_event.clear()
-        last_event.update({"status": "command_failed", "error": str(exc)})
-        return JSONResponse({"ok": False, "matched": True, "error": str(exc)}, status_code=502)
+        last_event.update({
+            "status": "command_failed",
+            "error": str(exc),
+        })
+        return JSONResponse(
+            {
+                "ok": False,
+                "matched": True,
+                "error": str(exc),
+            },
+            status_code=502,
+        )
